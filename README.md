@@ -267,8 +267,10 @@ test.
 | `DATABASE_URL` | Postgres connection string. Required except for `deploy --dry-run`. |
 | `SOROFORGE_SECRET_KEY` | Deployer secret seed (`S...`). |
 | `SOROFORGE_KEYSTORE_PATH` | Path to a file containing only the seed. |
-| `SOROFORGE_API_TOKEN` | Bearer token for `serve`. Required to start it. |
+| `SOROFORGE_API_TOKEN` | Read-write bearer token for `serve`. |
+| `SOROFORGE_API_TOKENS` | Scoped bearer tokens for `serve`, as `name:scope:token` entries — see below. |
 | `SOROFORGE_API_ADDR` | Listen address (default `127.0.0.1:8080`). |
+| `SOROFORGE_LOG_FORMAT` | `text` (default) or `json`; same as `--log-format`. |
 | `SOROFORGE_CONFIG` | Config file path (default `./soroforge.yaml`). |
 | `TEST_DATABASE_URL` | Enables Postgres integration tests. |
 | `SOROFORGE_LIVE` | Enables the live testnet smoke tests. |
@@ -277,8 +279,22 @@ test.
 
 ## CLI reference
 
-Global flags: `--config/-c`, `--network/-n`, `--log-level`, `--json`.
-Output goes to stdout and logs to stderr, so `--json` output stays pipeable.
+Global flags: `--config/-c`, `--network/-n`, `--log-level`, `--log-format`,
+`--json`. Output goes to stdout and logs to stderr, so `--json` output stays
+pipeable.
+
+`--log-format text|json` (default `text`, or `$SOROFORGE_LOG_FORMAT`) selects
+the slog handler. JSON mode writes one JSON object per line, for CI and log
+aggregators (Loki, CloudWatch, Datadog) that filter by field rather than
+regex:
+
+```bash
+soroforge deploy counter --log-format json
+{"time":"2026-01-02T15:04:05Z","level":"INFO","msg":"loaded signing key","source":"env:SOROFORGE_SECRET_KEY","address":"G..."}
+```
+
+An unknown format is rejected with the accepted values rather than silently
+falling back.
 
 | Command | Description |
 |---|---|
@@ -326,18 +342,47 @@ call the same service, so behaviour cannot drift between them.
 soroforge serve
 ```
 
-Every `/v1` endpoint requires `Authorization: Bearer $SOROFORGE_API_TOKEN`. The
-server **refuses to start without a token** — see the security notes.
+Every `/v1` endpoint requires `Authorization: Bearer <token>`. The server
+**refuses to start without a token** — see the security notes.
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Liveness. No auth. |
-| `POST` | `/v1/deploy` | `{"alias","network","notes","dry_run"}` → `201` (`200` for a dry run). |
-| `POST` | `/v1/upgrade` | Same body → `200`. |
-| `GET` | `/v1/contracts?network=` | Tracked contracts. |
-| `GET` | `/v1/contracts/{network}/{alias}/history` | Deployment history. |
-| `GET` | `/v1/contracts/{network}/{alias}/status` | Drift check. |
-| `GET` | `/v1/contracts/{network}/status` | Drift check of every tracked contract; `in_sync` is the verdict. |
+### Scoped tokens
+
+`SOROFORGE_API_TOKEN` is a read-write token, so existing single-token setups
+keep working unchanged. `SOROFORGE_API_TOKENS` adds scoped tokens as a
+comma-separated list of `name:scope:token` entries:
+
+```
+SOROFORGE_API_TOKEN=$(openssl rand -hex 32)             # read-write
+SOROFORGE_API_TOKENS="dashboard:read:$DASHBOARD_TOKEN,ci:write:$CI_TOKEN"
+```
+
+- `read` tokens may call `GET` routes only. `write` tokens may call everything
+  (write implies read).
+- The name is a label for access logs (`"token":"dashboard"`), never the value.
+- Tokens must be at least 16 characters, and names and values must be unique.
+- A token is compared in constant time against every configured token, so
+  timing cannot reveal which one matched or how far a guess got.
+
+Use a read-only token for dashboards, monitoring jobs, and anything that only
+reads state — it still cannot be used to sign a mainnet transaction if it leaks.
+A valid token that lacks the required scope gets **403 Forbidden**, not 401:
+the credential is real, the operation simply isn't permitted. A missing or
+unknown token is **401 Unauthorized**.
+
+| Method | Path | Scope | Description |
+|---|---|---|---|
+| `GET` | `/health` | public | Liveness. Process up; dependencies not checked. |
+| `GET` | `/ready` | public | Readiness. `200` when the database answers and each configured network's RPC returns a latest ledger; `503` with the failing dependency names otherwise. Checks are cached briefly so probes cannot hammer the RPC. |
+| `POST` | `/v1/deploy` | write | `{"alias","network","notes","dry_run"}` → `201` (`200` for a dry run). |
+| `POST` | `/v1/upgrade` | write | Same body → `200`. |
+| `GET` | `/v1/contracts?network=` | read | Tracked contracts. |
+| `GET` | `/v1/contracts/{network}/{alias}/history` | read | Deployment history. |
+| `GET` | `/v1/contracts/{network}/{alias}/status` | read | Drift check. |
+| `GET` | `/v1/contracts/{network}/status` | read | Drift check of every tracked contract; `in_sync` is the verdict. |
+
+Every route's scope is declared in one table in
+[`internal/api/api.go`](internal/api/api.go), and a test walks the built router
+to fail if a route is ever added without one.
 
 ```bash
 curl -X POST http://localhost:8080/v1/deploy \
@@ -349,6 +394,18 @@ curl -X POST http://localhost:8080/v1/deploy \
 Unknown JSON fields are rejected, so a misspelled `dry_run` fails loudly instead
 of deploying for real. Failures return `{"error": "..."}`; drift returns `200`
 with `"state":"drift"`, because the check ran and produced an answer.
+
+Each request writes one structured access log line to stderr at `info` — method,
+route pattern, status, duration, request ID, client address, and the token's
+name:
+
+```json
+{"time":"2026-01-02T15:04:05Z","level":"INFO","msg":"http request","method":"POST","route":"/v1/deploy","status":201,"duration":1843000000,"request_id":"...","remote_addr":"127.0.0.1:52344","token":"ci"}
+```
+
+The bearer token value, request bodies, and key material are never logged.
+`/health` is logged at `debug` only, so a liveness probe polling every second
+does not flood the log.
 
 ---
 
@@ -380,12 +437,17 @@ a malformed seed is still a secret, and errors end up in CI logs.
   laptop that also deploys to testnet.
 - Always `--dry-run` against mainnet first.
 
-**HTTP API:** the server refuses to start without `SOROFORGE_API_TOKEN`, and
-rejects tokens shorter than 16 characters. Tokens are compared in constant time,
-since a naive comparison leaks how much of the token matched through response
-timing. It binds `127.0.0.1` by default because this process holds a signing
-key; widen that only behind your own TLS and authentication. Generate a real
-token with `openssl rand -hex 32`.
+**HTTP API:** the server refuses to start without `SOROFORGE_API_TOKEN` or
+`SOROFORGE_API_TOKENS`, and rejects tokens shorter than 16 characters. Tokens
+are compared in constant time, since a naive comparison leaks how much of the
+token matched through response timing. It binds `127.0.0.1` by default because
+this process holds a signing key; widen that only behind your own TLS and
+authentication. Generate a real token with `openssl rand -hex 32`.
+
+Prefer a **read-only token** (`name:read:...`) for anything that does not
+deploy — a dashboard, a monitoring job, a status page. It can call every `GET`
+route but is refused with `403` on `/v1/deploy` and `/v1/upgrade`, so a leak
+cannot become a mainnet transaction.
 
 **Not implemented, by design:** key generation, multisig or threshold signing,
 hardware wallets, and CI plugin integrations. The `stellar.Signer` interface is
@@ -403,6 +465,7 @@ internal/stellar/   RPC client, transaction assembly, signing (all interfaced)
 internal/deploy/    deploy/upgrade/status orchestration
 internal/store/     Postgres history + embedded migrations
 internal/api/       chi HTTP handlers mirroring the CLI
+internal/readiness/ database + per-network RPC probes behind GET /ready
 internal/catalog/   best-effort registration with SoroVault after a deploy
 ```
 

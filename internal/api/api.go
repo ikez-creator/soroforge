@@ -7,7 +7,9 @@
 // package, where it is exercised by both surfaces.
 //
 // Mutating endpoints require a bearer token and the server refuses to start
-// without one; see auth.go.
+// without one; see auth.go. Every route declares the scope it needs in the
+// table returned by handlers.routes, and a test walks the built router to
+// prove no route was added around that table.
 package api
 
 import (
@@ -23,6 +25,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/soroworks/soroforge/internal/deploy"
+	"github.com/soroworks/soroforge/internal/readiness"
 	"github.com/soroworks/soroforge/internal/store"
 )
 
@@ -40,6 +43,16 @@ type Service interface {
 	History(ctx context.Context, network, alias string) ([]store.Deployment, error)
 }
 
+// Readiness reports whether SoroForge's dependencies are usable. It backs
+// GET /ready.
+//
+// It is declared here as a one-method interface so the handlers cannot reach
+// past it into a database or RPC client: the API package checks dependencies
+// through this seam, never directly.
+type Readiness interface {
+	Check(ctx context.Context) readiness.Status
+}
+
 // requestTimeout bounds a single API request.
 //
 // A deploy waits for two transactions to be confirmed, so this has to be
@@ -52,25 +65,66 @@ type Options struct {
 	// Service performs the work. Required.
 	Service Service
 
-	// Token is the bearer token required by mutating endpoints. The server
-	// refuses to start if it is empty or too short.
-	Token string
+	// Tokens are the bearer credentials the API accepts. At least one is
+	// required; the server refuses to start without one.
+	Tokens []Token
+
+	// Readiness checks dependencies for GET /ready. Required.
+	Readiness Readiness
 
 	// Log defaults to slog.Default().
 	Log *slog.Logger
 }
 
+// route is one endpoint, the scope a token must hold to call it, and its
+// handler.
+type route struct {
+	method  string
+	pattern string
+	scope   Scope
+	handler http.HandlerFunc
+}
+
+// routes returns every endpoint the API serves, each with its required scope.
+//
+// This table is the single place route permissions are declared: NewRouter
+// mounts exactly these entries, wrapping each in the middleware for its scope,
+// and TestEveryRouteHasAScope walks the finished router to prove nothing was
+// added around it. A new endpoint that forgets to declare its scope fails the
+// test rather than silently inheriting access.
+//
+// ScopePublic routes (/health and /ready) deliberately take no token: a
+// monitoring system should not need to hold a credential that can deploy in
+// order to ask whether the process is alive or ready.
+func (h *handlers) routes() []route {
+	return []route{
+		{http.MethodGet, "/health", ScopePublic, h.health},
+		{http.MethodGet, "/ready", ScopePublic, h.ready},
+
+		{http.MethodPost, "/v1/deploy", ScopeWrite, h.deploy},
+		{http.MethodPost, "/v1/upgrade", ScopeWrite, h.upgrade},
+
+		{http.MethodGet, "/v1/contracts", ScopeRead, h.listContracts},
+		{http.MethodGet, "/v1/contracts/{network}/{alias}/history", ScopeRead, h.history},
+		{http.MethodGet, "/v1/contracts/{network}/{alias}/status", ScopeRead, h.status},
+		{http.MethodGet, "/v1/contracts/{network}/status", ScopeRead, h.statusAll},
+	}
+}
+
 // NewRouter builds the HTTP handler.
 //
-// It returns an error rather than a router when the token is unusable, so that
-// a misconfigured server fails at startup instead of serving unauthenticated
-// deploy endpoints.
+// It returns an error rather than a router when the tokens are unusable or a
+// required dependency is missing, so that a misconfigured server fails at
+// startup instead of serving unauthenticated deploy endpoints.
 func NewRouter(opts Options) (http.Handler, error) {
 	if opts.Service == nil {
 		return nil, fmt.Errorf("api: service is required")
 	}
-	if err := validateToken(opts.Token); err != nil {
+	if err := validateTokens(opts.Tokens); err != nil {
 		return nil, err
+	}
+	if opts.Readiness == nil {
+		return nil, fmt.Errorf("api: readiness is required")
 	}
 
 	log := opts.Log
@@ -78,30 +132,80 @@ func NewRouter(opts Options) (http.Handler, error) {
 		log = slog.Default()
 	}
 
-	h := &handlers{svc: opts.Service, log: log}
+	h := &handlers{svc: opts.Service, readiness: opts.Readiness, log: log}
+	auth := &authenticator{tokens: opts.Tokens}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	// The access log wraps the recoverer so a panic's 500 is logged with its
+	// status like any other response.
+	r.Use(accessLog(log))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
 
-	// Unauthenticated: a liveness probe must work without distributing the
-	// deploy token to every monitoring system.
-	r.Get("/health", h.health)
-
-	r.Route("/v1", func(r chi.Router) {
-		r.Use(BearerAuth(opts.Token))
-
-		r.Post("/deploy", h.deploy)
-		r.Post("/upgrade", h.upgrade)
-
-		r.Get("/contracts", h.listContracts)
-		r.Get("/contracts/{network}/{alias}/history", h.history)
-		r.Get("/contracts/{network}/{alias}/status", h.status)
-		r.Get("/contracts/{network}/status", h.statusAll)
-	})
+	for _, rt := range h.routes() {
+		r.With(auth.authorize(rt.scope, rt.pattern)).Method(rt.method, rt.pattern, rt.handler)
+	}
 
 	return r, nil
+}
+
+// accessLog returns middleware that writes one structured line per request.
+//
+// It never logs headers or bodies: the Authorization header carries the bearer
+// token, and a deploy body can contain anything. Logging the matched token's
+// name is enough to answer "who deployed this" without the value appearing
+// anywhere.
+//
+// Requests to /health are logged at debug level so that a liveness probe
+// polling every second cannot bury real traffic.
+func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			info, r := withRequestInfo(r)
+
+			start := time.Now()
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			next.ServeHTTP(ww, r)
+
+			status := ww.Status()
+			if status == 0 {
+				// The handler wrote nothing — the implicit status is 200.
+				status = http.StatusOK
+			}
+
+			pattern := routePattern(r)
+			attrs := []slog.Attr{
+				slog.String("method", r.Method),
+				slog.String("route", pattern),
+				slog.Int("status", status),
+				slog.Duration("duration", time.Since(start)),
+				slog.String("request_id", middleware.GetReqID(r.Context())),
+				slog.String("remote_addr", r.RemoteAddr),
+			}
+			if info.tokenName != "" {
+				attrs = append(attrs, slog.String("token", info.tokenName))
+			}
+
+			level := slog.LevelInfo
+			if pattern == "/health" {
+				level = slog.LevelDebug
+			}
+			log.LogAttrs(r.Context(), level, "http request", attrs...)
+		})
+	}
+}
+
+// routePattern returns the matched chi pattern, so logs say
+// /v1/contracts/{network}/{alias}/status rather than one line per path. For a
+// request that matched nothing, the raw path is the only useful answer.
+func routePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if pattern := rctx.RoutePattern(); pattern != "" {
+			return pattern
+		}
+	}
+	return r.URL.Path
 }
 
 // NewServer builds an http.Server with sensible timeouts.
@@ -121,8 +225,9 @@ func NewServer(addr string, handler http.Handler) *http.Server {
 }
 
 type handlers struct {
-	svc Service
-	log *slog.Logger
+	svc       Service
+	readiness Readiness
+	log       *slog.Logger
 }
 
 // errorResponse is the body returned for every failure, so clients can parse

@@ -28,12 +28,25 @@ const (
 	// up in shell history.
 	EnvKeystorePath = "SOROFORGE_KEYSTORE_PATH"
 
-	// EnvAPIToken is the bearer token required by the HTTP API. The server
-	// refuses to start when it is unset.
+	// EnvAPIToken is the original bearer token for the HTTP API. It grants
+	// read and write, so existing single-token deployments keep working. The
+	// server refuses to start when it and EnvAPITokens are both unset.
 	EnvAPIToken = "SOROFORGE_API_TOKEN"
+
+	// EnvAPITokens configures scoped bearer tokens as a comma-separated list
+	// of name:scope:token entries, where scope is "read" or "write" (write
+	// implies read). Read-only tokens can call GET routes and receive 403 on
+	// the mutating ones. Example:
+	//
+	//	SOROFORGE_API_TOKENS="dashboard:read:$DASHBOARD_TOKEN,ci:write:$CI_TOKEN"
+	EnvAPITokens = "SOROFORGE_API_TOKENS"
 
 	// EnvAPIAddr overrides the HTTP API listen address.
 	EnvAPIAddr = "SOROFORGE_API_ADDR"
+
+	// EnvLogFormat selects the logging handler: "text" (default) or "json".
+	// JSON is for CI and log aggregators that index structured fields.
+	EnvLogFormat = "SOROFORGE_LOG_FORMAT"
 )
 
 // DefaultAPIAddr is the listen address used when EnvAPIAddr is unset.
@@ -53,7 +66,9 @@ type Env struct {
 	SecretKey    string
 	KeystorePath string
 	APIToken     string
+	APITokens    string
 	APIAddr      string
+	LogFormat    string
 }
 
 // LoadEnv reads SoroForge's environment variables. It does not validate them:
@@ -65,7 +80,9 @@ func LoadEnv() Env {
 		SecretKey:    strings.TrimSpace(os.Getenv(EnvSecretKey)),
 		KeystorePath: strings.TrimSpace(os.Getenv(EnvKeystorePath)),
 		APIToken:     os.Getenv(EnvAPIToken),
+		APITokens:    strings.TrimSpace(os.Getenv(EnvAPITokens)),
 		APIAddr:      strings.TrimSpace(os.Getenv(EnvAPIAddr)),
+		LogFormat:    strings.ToLower(strings.TrimSpace(os.Getenv(EnvLogFormat))),
 	}
 }
 
@@ -135,7 +152,9 @@ func (e Env) Redacted() map[string]string {
 		EnvSecretKey:    redact(e.SecretKey),
 		EnvKeystorePath: e.KeystorePath, // a path is not itself a secret
 		EnvAPIToken:     redact(e.APIToken),
+		EnvAPITokens:    redact(e.APITokens),
 		EnvAPIAddr:      e.ListenAddr(),
+		EnvLogFormat:    e.LogFormat,
 	}
 }
 

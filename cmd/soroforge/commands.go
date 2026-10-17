@@ -15,6 +15,7 @@ import (
 	"github.com/soroworks/soroforge/internal/api"
 	"github.com/soroworks/soroforge/internal/config"
 	"github.com/soroworks/soroforge/internal/deploy"
+	"github.com/soroworks/soroforge/internal/readiness"
 	"github.com/soroworks/soroforge/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -258,18 +259,23 @@ func newServeCmd() *cobra.Command {
 		Short: "Run the HTTP API for CI pipelines",
 		Long: `Serve the same operations as the CLI over HTTP.
 
-Every endpoint requires a bearer token from SOROFORGE_API_TOKEN; the server
-refuses to start without one, because it can deploy contracts using the
-configured signing key. It binds 127.0.0.1 by default — override with --addr
-only when you have put authentication and TLS in front of it.
+Every /v1 endpoint requires a bearer token; the server refuses to start
+without one, because it can deploy contracts using the configured signing
+key. SOROFORGE_API_TOKEN is a read-write token. SOROFORGE_API_TOKENS adds
+scoped tokens as name:scope:token entries, where scope is read or write —
+use read for dashboards and monitoring, which can then only call GET routes.
+It binds 127.0.0.1 by default — override with --addr only when you have put
+authentication and TLS in front of it.
 
 Endpoints:
-  GET  /health
+  GET  /health   liveness, no auth
+  GET  /ready    readiness (database and each network's RPC), no auth
   POST /v1/deploy
   POST /v1/upgrade
   GET  /v1/contracts?network=<name>
   GET  /v1/contracts/{network}/{alias}/history
-  GET  /v1/contracts/{network}/{alias}/status`,
+  GET  /v1/contracts/{network}/{alias}/status
+  GET  /v1/contracts/{network}/status`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			a, err := newApp(cmd.Context(), appOptions{})
@@ -278,15 +284,31 @@ Endpoints:
 			}
 			defer a.Close()
 
+			tokens, err := api.ParseTokens(a.cfg.Env.APIToken, a.cfg.Env.APITokens)
+			if err != nil {
+				return err
+			}
+
+			readinessChecker, err := readiness.New(readiness.Options{
+				Store:   a.store,
+				Config:  a.cfg,
+				Clients: deploy.DefaultClientFactory,
+				Log:     slog.Default(),
+			})
+			if err != nil {
+				return err
+			}
+
 			listenAddr := addr
 			if listenAddr == "" {
 				listenAddr = a.cfg.Env.ListenAddr()
 			}
 
 			handler, err := api.NewRouter(api.Options{
-				Service: a.service,
-				Token:   a.cfg.Env.APIToken,
-				Log:     slog.Default(),
+				Service:   a.service,
+				Tokens:    tokens,
+				Readiness: readinessChecker,
+				Log:       slog.Default(),
 			})
 			if err != nil {
 				return err

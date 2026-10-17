@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -19,8 +20,15 @@ type globalFlags struct {
 	configPath string
 	network    string
 	logLevel   string
+	logFormat  string
 	jsonOutput bool
 }
+
+// Log output formats accepted by --log-format.
+const (
+	logFormatText = "text"
+	logFormatJSON = "json"
+)
 
 var flags globalFlags
 
@@ -45,7 +53,7 @@ The secret key is never logged, stored, or printed. See the README security note
 		// Errors are printed once here rather than by both cobra and main.
 		SilenceErrors: false,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-			return setupLogging()
+			return setupLogging(os.Stderr)
 		},
 	}
 
@@ -55,6 +63,8 @@ The secret key is never logged, stored, or printed. See the README security note
 		"network to target (default: the config's default_network)")
 	cmd.PersistentFlags().StringVar(&flags.logLevel, "log-level", "info",
 		"log verbosity: debug, info, warn, or error")
+	cmd.PersistentFlags().StringVar(&flags.logFormat, "log-format", "",
+		"log output format: text or json (default: text or $SOROFORGE_LOG_FORMAT)")
 	cmd.PersistentFlags().BoolVar(&flags.jsonOutput, "json", false,
 		"emit machine-readable JSON instead of human-readable text")
 
@@ -76,24 +86,51 @@ The secret key is never logged, stored, or printed. See the README security note
 // setupLogging configures slog.
 //
 // Logs go to stderr so that --json output on stdout stays parseable by a pipe.
-func setupLogging() error {
-	var level slog.Level
-	switch strings.ToLower(flags.logLevel) {
-	case "debug":
-		level = slog.LevelDebug
-	case "info":
-		level = slog.LevelInfo
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		return fmt.Errorf("invalid --log-level %q: expected debug, info, warn, or error", flags.logLevel)
+// The handler is text by default and becomes JSON when --log-format or
+// SOROFORGE_LOG_FORMAT asks for it: JSON lines are what CI and log aggregators
+// (Loki, CloudWatch, Datadog) index by field instead of regex.
+func setupLogging(w io.Writer) error {
+	level, err := parseLogLevel(flags.logLevel)
+	if err != nil {
+		return err
 	}
 
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	format := strings.ToLower(strings.TrimSpace(flags.logFormat))
+	if format == "" {
+		format = loadEnvOnly().LogFormat
+	}
+	if format == "" {
+		format = logFormatText
+	}
+
+	var handler slog.Handler
+	switch format {
+	case logFormatText:
+		handler = slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})
+	case logFormatJSON:
+		handler = slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})
+	default:
+		return fmt.Errorf("invalid --log-format %q: expected %s or %s", format, logFormatText, logFormatJSON)
+	}
+
 	slog.SetDefault(slog.New(handler))
 	return nil
+}
+
+// parseLogLevel maps the flag's name to a slog level.
+func parseLogLevel(name string) (slog.Level, error) {
+	switch strings.ToLower(name) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("invalid --log-level %q: expected debug, info, warn, or error", name)
+	}
 }
 
 // app bundles everything a command needs, along with the cleanup it owns.

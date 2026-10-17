@@ -14,7 +14,9 @@ func TestLoadEnvReadsAllVariables(t *testing.T) {
 	t.Setenv(EnvSecretKey, "SEED")
 	t.Setenv(EnvKeystorePath, "/keys/deployer")
 	t.Setenv(EnvAPIToken, "token")
+	t.Setenv(EnvAPITokens, "dashboard:read:readonly-token")
 	t.Setenv(EnvAPIAddr, "0.0.0.0:9000")
+	t.Setenv(EnvLogFormat, "JSON")
 
 	env := LoadEnv()
 
@@ -22,7 +24,10 @@ func TestLoadEnvReadsAllVariables(t *testing.T) {
 	assert.Equal(t, "SEED", env.SecretKey)
 	assert.Equal(t, "/keys/deployer", env.KeystorePath)
 	assert.Equal(t, "token", env.APIToken)
+	assert.Equal(t, "dashboard:read:readonly-token", env.APITokens)
 	assert.Equal(t, "0.0.0.0:9000", env.ListenAddr())
+	// The format is normalised so callers can compare it directly.
+	assert.Equal(t, "json", env.LogFormat)
 }
 
 func TestListenAddrDefaultsToLoopback(t *testing.T) {
@@ -106,6 +111,7 @@ func TestRedactedNeverExposesSecrets(t *testing.T) {
 		SecretKey:    "SDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEAD",
 		KeystorePath: "/keys/deployer",
 		APIToken:     "super-secret-token",
+		APITokens:    "dashboard:read:another-secret-token",
 	}
 
 	redacted := env.Redacted()
@@ -114,10 +120,12 @@ func TestRedactedNeverExposesSecrets(t *testing.T) {
 		assert.NotContains(t, value, "hunter2", "%s leaked the database password", key)
 		assert.NotContains(t, value, "SDEADBEEF", "%s leaked the secret key", key)
 		assert.NotContains(t, value, "super-secret-token", "%s leaked the API token", key)
+		assert.NotContains(t, value, "another-secret-token", "%s leaked a scoped API token", key)
 	}
 
 	assert.Equal(t, "(set)", redacted[EnvSecretKey])
 	assert.Equal(t, "(set)", redacted[EnvAPIToken])
+	assert.Equal(t, "(set)", redacted[EnvAPITokens])
 	assert.Equal(t, "(unset)", Env{}.Redacted()[EnvSecretKey])
 
 	// A path is not itself a secret and is useful for diagnosing which key
