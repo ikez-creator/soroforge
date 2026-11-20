@@ -190,6 +190,44 @@ func TestStatusRejectsUnknownContract(t *testing.T) {
 	assert.ErrorContains(t, err, "unknown contract")
 }
 
+func TestStatusEdgeCases(t *testing.T) {
+	// Status operates on named config entries, so its edge cases are the
+	// requests that cannot resolve: an empty or whitespace-only alias and a
+	// network that is not configured.
+	h := newHarness(t, harnessOptions{})
+
+	tests := []struct {
+		name    string
+		req     deploy.StatusRequest
+		wantErr string
+	}{
+		{
+			name:    "empty alias",
+			req:     deploy.StatusRequest{},
+			wantErr: "unknown contract",
+		},
+		{
+			name:    "whitespace-only alias",
+			req:     deploy.StatusRequest{Alias: "   "},
+			wantErr: "unknown contract",
+		},
+		{
+			name:    "unknown network",
+			req:     deploy.StatusRequest{Alias: "counter", Network: "staging"},
+			wantErr: "unknown network",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := h.svc.Status(context.Background(), tc.req)
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
 func TestListReturnsTrackedContracts(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	ctx := context.Background()

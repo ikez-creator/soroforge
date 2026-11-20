@@ -3,6 +3,7 @@ package netcheck
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -332,13 +333,116 @@ func TestCheckContinuesWhenOneNetworkCannotBeCreated(t *testing.T) {
 }
 
 func TestCheckEmptyConfig(t *testing.T) {
-	results := Check(context.Background(), map[string]config.Network{}, factoryFor(nil), time.Second)
-	assert.Empty(t, results)
+	tests := []struct {
+		name     string
+		networks map[string]config.Network
+	}{
+		{name: "nil network map", networks: nil},
+		{name: "empty network map", networks: map[string]config.Network{}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			results := Check(context.Background(), tc.networks, factoryFor(nil), time.Second)
+			assert.Empty(t, results)
+		})
+	}
+}
+
+// Check's edge cases decide whether a report is a failure or an empty sweep:
+// a timeout that must fall back to the default, and the largest ledger
+// sequence an endpoint can report.
+func TestCheckEdgeCases(t *testing.T) {
+	tests := []struct {
+		name         string
+		networks     map[string]config.Network
+		clients      map[string]stellar.Client
+		timeout      time.Duration
+		wantNetworks []string
+		wantLedgers  []uint32
+	}{
+		{
+			name: "zero timeout falls back to the default",
+			networks: map[string]config.Network{
+				"testnet": {RPCURL: "https://rpc.example.com", Passphrase: "P"},
+			},
+			// The delay only completes under DefaultTimeout; a literal zero
+			// timeout would cancel the probe before it answers.
+			clients: map[string]stellar.Client{
+				"testnet": &reportedClient{
+					stubClient: stubClient{ledger: 1, latency: time.Millisecond},
+					passphrase: "P",
+				},
+			},
+			timeout:      0,
+			wantNetworks: []string{"testnet"},
+			wantLedgers:  []uint32{1},
+		},
+		{
+			name: "negative timeout falls back to the default",
+			networks: map[string]config.Network{
+				"testnet": {RPCURL: "https://rpc.example.com", Passphrase: "P"},
+			},
+			clients: map[string]stellar.Client{
+				"testnet": &reportedClient{
+					stubClient: stubClient{ledger: 2, latency: time.Millisecond},
+					passphrase: "P",
+				},
+			},
+			timeout:      -time.Second,
+			wantNetworks: []string{"testnet"},
+			wantLedgers:  []uint32{2},
+		},
+		{
+			name: "maximum ledger sequence is accepted",
+			networks: map[string]config.Network{
+				"testnet": {RPCURL: "https://rpc.example.com", Passphrase: "P"},
+			},
+			clients: map[string]stellar.Client{
+				"testnet": &reportedClient{
+					stubClient: stubClient{ledger: math.MaxUint32},
+					passphrase: "P",
+				},
+			},
+			timeout:      time.Second,
+			wantNetworks: []string{"testnet"},
+			wantLedgers:  []uint32{math.MaxUint32},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			results := Check(context.Background(), tc.networks, factoryFor(tc.clients), tc.timeout)
+			require.Len(t, results, len(tc.wantNetworks))
+			for i, r := range results {
+				assert.Equal(t, tc.wantNetworks[i], r.Network)
+				assert.Equal(t, tc.wantLedgers[i], r.LatestLedger)
+				assert.True(t, r.OK, "a valid boundary case must still pass")
+				assert.Empty(t, r.Error)
+			}
+		})
+	}
 }
 
 // AnyFailure is what the CLI uses to choose its exit code.
 func TestAnyFailure(t *testing.T) {
-	assert.False(t, AnyFailure(nil))
-	assert.False(t, AnyFailure([]Result{{OK: true}, {OK: true}}))
-	assert.True(t, AnyFailure([]Result{{OK: true}, {OK: false, Error: "boom"}}))
+	tests := []struct {
+		name    string
+		results []Result
+		want    bool
+	}{
+		{name: "nil results", results: nil, want: false},
+		{name: "empty results", results: []Result{}, want: false},
+		{name: "all passing", results: []Result{{OK: true}, {OK: true}}, want: false},
+		{name: "one failure", results: []Result{{OK: true}, {OK: false, Error: "boom"}}, want: true},
+		{name: "zero-value result fails closed", results: []Result{{}}, want: true},
+		{name: "failure first", results: []Result{{Error: "boom"}, {OK: true}}, want: true},
+		{name: "all failing", results: []Result{{Error: "a"}, {Error: "b"}}, want: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, AnyFailure(tc.results))
+		})
+	}
 }
